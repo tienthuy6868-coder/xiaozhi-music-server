@@ -95,7 +95,12 @@ def _download_mp3(video_id: str) -> Path:
         "postprocessor_args": ["-ar", "44100", "-ac", "2"],
     }
     if COOKIES_FILE and os.path.exists(COOKIES_FILE):
-        ydl_opts["cookiefile"] = COOKIES_FILE
+        # Copy to writable /tmp so yt-dlp can update cookies without hitting read-only /etc/secrets
+        tmp_cookies = CACHE_DIR / "yt_cookies.txt"
+        if not tmp_cookies.exists():
+            import shutil
+            shutil.copy2(COOKIES_FILE, tmp_cookies)
+        ydl_opts["cookiefile"] = str(tmp_cookies)
 
     url = f"https://music.youtube.com/watch?v={video_id}"
     with yt_dlp.YoutubeDL(ydl_opts) as ydl:
