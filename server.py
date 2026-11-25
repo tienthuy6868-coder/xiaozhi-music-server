@@ -1,10 +1,10 @@
 import os
 import re
 import sys
-import uuid
 import shutil
 import asyncio
 import logging
+import urllib.request
 from pathlib import Path
 from typing import Optional
 
@@ -19,13 +19,14 @@ logger = logging.getLogger("MusicServer")
 CACHE_DIR = Path(os.environ.get("MUSIC_CACHE_DIR", "/tmp/music_cache"))
 CACHE_DIR.mkdir(parents=True, exist_ok=True)
 MAX_CACHE_FILES = int(os.environ.get("MAX_CACHE_FILES", "8"))
-MP3_BITRATE = os.environ.get("MP3_BITRATE", "128k")
+MP3_BITRATE = os.environ.get("MP3_BITRATE", "96k")
 COOKIES_FILE = os.environ.get("YTDLP_COOKIES", "")
 
 app = FastAPI(title="Xiaozhi Music Server")
 ytmusic = YTMusic()
 # Map audio filename -> original search query for seamless SoundCloud fallback
 PENDING_QUERIES: dict[str, str] = {}
+DOWNLOAD_TASKS: dict[str, asyncio.Task] = {}
 
 
 def _get_cookies_path() -> Optional[str]:
@@ -108,48 +109,38 @@ def _search_soundcloud_meta(query: str) -> Optional[dict]:
         }
 
 
-def _build_ytdlp_attempts(filename: str, query: str) -> list[tuple[str, list[str]]]:
-    base = [
-        sys.executable, "-m", "yt_dlp",
-        "--no-playlist", "--no-warnings", "--quiet",
-        "-f", "bestaudio*/best", "-o", "-",
-    ]
-    attempts: list[tuple[str, list[str]]] = []
+def _extract_stream_url(url_or_query: str, use_cookies: bool = False, player_clients: Optional[list[str]] = None) -> Optional[dict]:
+    """Fast in-process yt-dlp URL extraction (no subprocess Python startup)."""
+    ydl_opts = {
+        "format": "bestaudio*/best",
+        "quiet": True,
+        "no_warnings": True,
+        "noplaylist": True,
+        "socket_timeout": 5,
+    }
+    if player_clients:
+        ydl_opts["extractor_args"] = {"youtube": {"player_client": player_clients}}
+    if use_cookies:
+        cookies_path = _get_cookies_path()
+        if cookies_path:
+            ydl_opts["cookiefile"] = cookies_path
 
-    if filename.startswith("sc_"):
-        if query:
-            attempts.append(("soundcloud", base + [f"scsearch1:{query}"]))
-        return attempts
-
-    video_id = filename[:-4]
-    if not re.fullmatch(r"[A-Za-z0-9_-]{6,20}", video_id):
-        return attempts
-
-    yt_url = f"https://music.youtube.com/watch?v={video_id}"
-    cookies_path = _get_cookies_path()
-    if cookies_path:
-        attempts.append((
-            "ytmusic-cookies",
-            base + [
-                "--cookies", cookies_path,
-                "--js-runtimes", "node",
-                "--extractor-args", "youtube:player_client=tv,web",
-                yt_url,
-            ],
-        ))
-    else:
-        attempts.append((
-            "ytmusic-android_vr",
-            base + [
-                "--extractor-args", "youtube:player_client=android_vr",
-                yt_url,
-            ],
-        ))
-
-    if query:
-        attempts.append(("soundcloud-fallback", base + [f"scsearch1:{query}"]))
-
-    return attempts
+    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+        info = ydl.extract_info(url_or_query, download=False)
+        if "entries" in info:
+            entries = info.get("entries") or []
+            if not entries:
+                return None
+            info = entries[0]
+        stream_url = info.get("url")
+        if not stream_url:
+            return None
+        return {
+            "url": stream_url,
+            "ext": (info.get("ext") or "").lower(),
+            "protocol": (info.get("protocol") or "").lower(),
+            "headers": info.get("http_headers") or {},
+        }
 
 
 async def _terminate_proc(proc: Optional[asyncio.subprocess.Process]) -> None:
@@ -164,90 +155,150 @@ async def _terminate_proc(proc: Optional[asyncio.subprocess.Process]) -> None:
             pass
 
 
-async def _stream_pipe_mp3(filename: str, target_mp3: Path, query: str):
-    """Stream MP3 in real time via yt-dlp -> ffmpeg pipe while caching to disk."""
-    attempts = _build_ytdlp_attempts(filename, query)
-    if not attempts:
-        return
+def _download_direct_mp3_sync(stream_url: str, headers: dict, part_path: Path) -> int:
+    req = urllib.request.Request(stream_url, headers=headers)
+    total = 0
+    with urllib.request.urlopen(req, timeout=15) as resp, open(part_path, "wb") as f:
+        while True:
+            chunk = resp.read(32768)
+            if not chunk:
+                break
+            f.write(chunk)
+            f.flush()
+            total += len(chunk)
+    return total
 
-    for label, ytdlp_cmd in attempts:
-        tmp_path = CACHE_DIR / f"{filename}.{uuid.uuid4().hex[:6]}.tmp"
-        yt_proc = None
-        ff_proc = None
-        read_fd, write_fd = os.pipe()
-        try:
-            yt_proc = await asyncio.create_subprocess_exec(
-                *ytdlp_cmd,
-                stdout=write_fd,
-                stderr=asyncio.subprocess.PIPE,
-            )
-            os.close(write_fd)
-            write_fd = -1
 
-            ff_cmd = [
-                "ffmpeg", "-loglevel", "error",
-                "-i", "pipe:0",
-                "-vn", "-acodec", "libmp3lame",
-                "-b:a", MP3_BITRATE,
-                "-ar", "44100", "-ac", "2",
-                "-f", "mp3", "pipe:1",
-            ]
-            ff_proc = await asyncio.create_subprocess_exec(
-                *ff_cmd,
-                stdin=read_fd,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-            )
-            os.close(read_fd)
-            read_fd = -1
+async def _ffmpeg_stream_to_part(stream_url: str, headers: dict, part_path: Path) -> int:
+    ff_cmd = ["ffmpeg", "-loglevel", "error"]
+    if stream_url.startswith("http"):
+        ff_cmd += ["-reconnect", "1", "-reconnect_streamed", "1", "-reconnect_delay_max", "3"]
+    if headers:
+        hdr_str = "".join(f"{k}: {v}\r\n" for k, v in headers.items())
+        ff_cmd += ["-headers", hdr_str]
+    ff_cmd += [
+        "-i", stream_url,
+        "-vn", "-acodec", "libmp3lame",
+        "-b:a", MP3_BITRATE,
+        "-compression_level", "7",
+        "-threads", "1",
+        "-ar", "44100", "-ac", "2",
+        "-f", "mp3", "pipe:1",
+    ]
+    ff_proc = await asyncio.create_subprocess_exec(
+        *ff_cmd,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+    )
+    total = 0
+    try:
+        with open(part_path, "wb") as f:
+            while True:
+                chunk = await ff_proc.stdout.read(32768)
+                if not chunk:
+                    break
+                f.write(chunk)
+                f.flush()
+                total += len(chunk)
+        rc = await ff_proc.wait()
+        if rc != 0 or total <= 4096:
+            err = (await ff_proc.stderr.read()).decode("utf-8", errors="ignore").strip()
+            logger.warning(f"ffmpeg failed (rc={rc}, bytes={total}): {err[:200]}")
+            return 0
+        return total
+    except Exception:
+        await _terminate_proc(ff_proc)
+        raise
 
-            first_chunk = await ff_proc.stdout.read(8192)
-            if not first_chunk:
-                yt_err = (await yt_proc.stderr.read()).decode("utf-8", errors="ignore").strip()
-                ff_err = (await ff_proc.stderr.read()).decode("utf-8", errors="ignore").strip()
-                logger.warning(f"[{label}] produced 0 bytes for {filename}: yt={yt_err[:200]} ff={ff_err[:200]}")
-                await _terminate_proc(yt_proc)
-                await _terminate_proc(ff_proc)
+
+async def _download_to_part(filename: str, target_mp3: Path, query: str) -> None:
+    """Resolve stream URL (ytmusic -> SoundCloud fallback) and write MP3 to .part -> .mp3."""
+    part_path = CACHE_DIR / f"{filename}.part"
+    part_path.unlink(missing_ok=True)
+    try:
+        candidates: list[tuple[str, dict]] = []
+        if not filename.startswith("sc_"):
+            video_id = filename[:-4]
+            yt_url = f"https://music.youtube.com/watch?v={video_id}"
+            try:
+                info = await asyncio.to_thread(_extract_stream_url, yt_url, True, ["tv", "web"])
+                if info:
+                    candidates.append(("ytmusic-cookies", info))
+            except Exception as e:
+                logger.warning(f"[ytmusic-cookies] extract failed for {filename}: {str(e)[:160]}")
+
+        if query:
+            try:
+                sc_info = await asyncio.to_thread(_extract_stream_url, f"scsearch1:{query}", False, None)
+                if sc_info:
+                    candidates.append(("soundcloud", sc_info))
+            except Exception as e:
+                logger.warning(f"[soundcloud] extract failed for '{query}': {str(e)[:160]}")
+
+        for label, info in candidates:
+            try:
+                part_path.unlink(missing_ok=True)
+                if info["ext"] == "mp3" and info["protocol"] in ("http", "https"):
+                    total = await asyncio.to_thread(_download_direct_mp3_sync, info["url"], info["headers"], part_path)
+                else:
+                    total = await _ffmpeg_stream_to_part(info["url"], info["headers"], part_path)
+
+                if total > 4096 and part_path.exists():
+                    os.replace(part_path, target_mp3)
+                    _cleanup_cache()
+                    logger.info(f"[{label}] cached {filename} ({total} bytes)")
+                    return
+            except Exception as e:
+                logger.warning(f"[{label}] stream failed for {filename}: {e}")
+                part_path.unlink(missing_ok=True)
+    finally:
+        DOWNLOAD_TASKS.pop(filename, None)
+
+
+def _ensure_download_task(filename: str, target_mp3: Path, query: str) -> Optional[asyncio.Task]:
+    if target_mp3.exists() and target_mp3.stat().st_size > 1024:
+        return None
+    task = DOWNLOAD_TASKS.get(filename)
+    if task is None or task.done():
+        task = asyncio.create_task(_download_to_part(filename, target_mp3, query))
+        DOWNLOAD_TASKS[filename] = task
+    return task
+
+
+async def _tail_mp3_stream(filename: str, target_mp3: Path, task: Optional[asyncio.Task]):
+    """Tail .part (and final .mp3) as bytes arrive so ESP32-S3 starts playing ASAP."""
+    part_path = CACHE_DIR / f"{filename}.part"
+    offset = 0
+    while True:
+        src = target_mp3 if target_mp3.exists() else (part_path if part_path.exists() else None)
+        if src is not None:
+            try:
+                with open(src, "rb") as f:
+                    f.seek(offset)
+                    data = f.read(32768)
+                if data:
+                    offset += len(data)
+                    yield data
+                    continue
+            except FileNotFoundError:
+                # Renamed from .part to .mp3 mid-read; retry on target_mp3
                 continue
 
-            total_bytes = 0
-            with open(tmp_path, "wb") as f:
-                f.write(first_chunk)
-                total_bytes += len(first_chunk)
-                yield first_chunk
+        if task is None or task.done():
+            # Final flush check in case bytes landed right as task completed
+            final_src = target_mp3 if target_mp3.exists() else (part_path if part_path.exists() else None)
+            if final_src is not None:
+                with open(final_src, "rb") as f:
+                    f.seek(offset)
+                    while True:
+                        tail = f.read(32768)
+                        if not tail:
+                            break
+                        offset += len(tail)
+                        yield tail
+            break
 
-                while True:
-                    chunk = await ff_proc.stdout.read(32768)
-                    if not chunk:
-                        break
-                    f.write(chunk)
-                    total_bytes += len(chunk)
-                    yield chunk
-
-            await yt_proc.wait()
-            ff_rc = await ff_proc.wait()
-            if ff_rc == 0 and total_bytes > 4096:
-                os.replace(tmp_path, target_mp3)
-                _cleanup_cache()
-                logger.info(f"[{label}] streamed & cached {filename} ({total_bytes} bytes)")
-            else:
-                tmp_path.unlink(missing_ok=True)
-            return
-        except asyncio.CancelledError:
-            tmp_path.unlink(missing_ok=True)
-            await _terminate_proc(yt_proc)
-            await _terminate_proc(ff_proc)
-            raise
-        except Exception as e:
-            logger.warning(f"[{label}] stream error for {filename}: {e}")
-            tmp_path.unlink(missing_ok=True)
-            await _terminate_proc(yt_proc)
-            await _terminate_proc(ff_proc)
-        finally:
-            if write_fd != -1:
-                os.close(write_fd)
-            if read_fd != -1:
-                os.close(read_fd)
+        await asyncio.sleep(0.1)
 
 
 @app.api_route("/", methods=["GET", "HEAD"])
@@ -265,7 +316,7 @@ async def stream_pcm(
     song: str = Query(..., min_length=1),
     artist: str = Query("", description="Optional artist name"),
 ):
-    """Fast metadata lookup (<1.5s) compatible with Esp32Music::Download."""
+    """Fast metadata lookup (<1.5s) + background pre-download compatible with Esp32Music::Download."""
     query = f"{song} {artist}".strip()
     meta = await asyncio.to_thread(_search_ytmusic, song, artist)
     if meta and meta.get("video_id"):
@@ -273,6 +324,7 @@ async def stream_pcm(
         PENDING_QUERIES[filename] = query
         if len(PENDING_QUERIES) > 100:
             PENDING_QUERIES.pop(next(iter(PENDING_QUERIES)))
+        _ensure_download_task(filename, CACHE_DIR / filename, query)
         return {
             "title": meta["title"],
             "artist": meta["artist"],
@@ -287,6 +339,7 @@ async def stream_pcm(
         if sc_meta:
             filename = sc_meta["filename"]
             PENDING_QUERIES[filename] = query
+            _ensure_download_task(filename, CACHE_DIR / filename, query)
             return {
                 "title": sc_meta["title"],
                 "artist": sc_meta["artist"],
@@ -311,7 +364,8 @@ async def get_audio(filename: str, q: str = Query("", description="Optional fall
         return FileResponse(path, media_type="audio/mpeg")
 
     query = q or PENDING_QUERIES.get(filename, "")
+    task = _ensure_download_task(filename, path, query)
     return StreamingResponse(
-        _stream_pipe_mp3(filename, path, query),
+        _tail_mp3_stream(filename, path, task),
         media_type="audio/mpeg",
     )
