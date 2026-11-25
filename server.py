@@ -135,7 +135,11 @@ def _extract_stream_url(url_or_query: str, use_cookies: bool = False, player_cli
             preferred = [e for e in entries if 60 <= (e.get("duration") or 0) <= max_duration]
             if not preferred:
                 preferred = [e for e in entries if (e.get("duration") or 0) <= max_duration]
-            info = preferred[0] if preferred else entries[0]
+            chosen = preferred[0] if preferred else entries[0]
+            if not chosen.get("url") and chosen.get("webpage_url"):
+                info = ydl.extract_info(chosen["webpage_url"], download=False)
+            else:
+                info = chosen
         stream_url = info.get("url")
         if not stream_url:
             return None
@@ -216,36 +220,28 @@ async def _ffmpeg_stream_to_part(stream_url: str, headers: dict, part_path: Path
 
 
 async def _download_to_part(filename: str, target_mp3: Path, query: str) -> None:
-    """Resolve stream URL (ytmusic & SoundCloud in parallel) and write MP3 to .part -> .mp3."""
+    """Resolve stream URL (fast SoundCloud by default; optional YouTube via ENABLE_YTDLP_YOUTUBE=1) and write MP3."""
     part_path = CACHE_DIR / f"{filename}.part"
     part_path.unlink(missing_ok=True)
     try:
-        async def _try_yt() -> Optional[dict]:
-            if filename.startswith("sc_"):
-                return None
+        candidates: list[tuple[str, dict]] = []
+        if os.environ.get("ENABLE_YTDLP_YOUTUBE", "0") == "1" and not filename.startswith("sc_"):
             video_id = filename[:-4]
             yt_url = f"https://music.youtube.com/watch?v={video_id}"
             try:
-                return await asyncio.to_thread(_extract_stream_url, yt_url, True, ["tv", "web"])
+                yt_info = await asyncio.to_thread(_extract_stream_url, yt_url, True, ["tv", "web"])
+                if yt_info:
+                    candidates.append(("ytmusic-cookies", yt_info))
             except Exception as e:
                 logger.warning(f"[ytmusic-cookies] extract failed for {filename}: {str(e)[:160]}")
-                return None
 
-        async def _try_sc() -> Optional[dict]:
-            if not query:
-                return None
+        if query:
             try:
-                return await asyncio.to_thread(_extract_stream_url, f"scsearch3:{query}", False, None)
+                sc_info = await asyncio.to_thread(_extract_stream_url, f"scsearch1:{query}", False, None)
+                if sc_info:
+                    candidates.append(("soundcloud", sc_info))
             except Exception as e:
                 logger.warning(f"[soundcloud] extract failed for '{query}': {str(e)[:160]}")
-                return None
-
-        yt_info, sc_info = await asyncio.gather(_try_yt(), _try_sc())
-        candidates: list[tuple[str, dict]] = []
-        if yt_info:
-            candidates.append(("ytmusic-cookies", yt_info))
-        if sc_info:
-            candidates.append(("soundcloud", sc_info))
 
         for label, info in candidates:
             try:
