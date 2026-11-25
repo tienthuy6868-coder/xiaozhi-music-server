@@ -112,7 +112,7 @@ def _build_ytdlp_attempts(filename: str, query: str) -> list[tuple[str, list[str
     base = [
         sys.executable, "-m", "yt_dlp",
         "--no-playlist", "--no-warnings", "--quiet",
-        "--no-cache-dir", "-f", "bestaudio/best", "-o", "-",
+        "-f", "bestaudio*/best", "-o", "-",
     ]
     attempts: list[tuple[str, list[str]]] = []
 
@@ -133,19 +133,18 @@ def _build_ytdlp_attempts(filename: str, query: str) -> list[tuple[str, list[str
             base + [
                 "--cookies", cookies_path,
                 "--js-runtimes", "node",
-                "--remote-components", "ejs:github",
-                "--extractor-args", "youtube:player_client=web_safari,mweb,web,tv",
+                "--extractor-args", "youtube:player_client=tv,web",
                 yt_url,
             ],
         ))
-
-    attempts.append((
-        "ytmusic-android_vr",
-        base + [
-            "--extractor-args", "youtube:player_client=android_vr",
-            yt_url,
-        ],
-    ))
+    else:
+        attempts.append((
+            "ytmusic-android_vr",
+            base + [
+                "--extractor-args", "youtube:player_client=android_vr",
+                yt_url,
+            ],
+        ))
 
     if query:
         attempts.append(("soundcloud-fallback", base + [f"scsearch1:{query}"]))
