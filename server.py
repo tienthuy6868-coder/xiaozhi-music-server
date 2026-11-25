@@ -219,6 +219,21 @@ async def _ffmpeg_stream_to_part(stream_url: str, headers: dict, part_path: Path
         raise
 
 
+def _search_soundcloud_url(query: str, max_duration: int = 600) -> Optional[str]:
+    """Fast flat SoundCloud search (1 request) picking a normal-length song (60s..600s)."""
+    ydl_opts = {"quiet": True, "no_warnings": True, "extract_flat": True, "socket_timeout": 5}
+    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+        info = ydl.extract_info(f"scsearch5:{query}", download=False)
+        entries = [e for e in (info.get("entries") or []) if e]
+        if not entries:
+            return None
+        preferred = [e for e in entries if 60 <= (e.get("duration") or 0) <= max_duration]
+        if not preferred:
+            preferred = [e for e in entries if (e.get("duration") or 0) <= max_duration]
+        chosen = preferred[0] if preferred else entries[0]
+        return chosen.get("url") or chosen.get("webpage_url")
+
+
 async def _download_to_part(filename: str, target_mp3: Path, query: str) -> None:
     """Resolve stream URL (fast SoundCloud by default; optional YouTube via ENABLE_YTDLP_YOUTUBE=1) and write MP3."""
     part_path = CACHE_DIR / f"{filename}.part"
@@ -237,9 +252,11 @@ async def _download_to_part(filename: str, target_mp3: Path, query: str) -> None
 
         if query:
             try:
-                sc_info = await asyncio.to_thread(_extract_stream_url, f"scsearch1:{query}", False, None)
-                if sc_info:
-                    candidates.append(("soundcloud", sc_info))
+                sc_url = await asyncio.to_thread(_search_soundcloud_url, query, 600)
+                if sc_url:
+                    sc_info = await asyncio.to_thread(_extract_stream_url, sc_url, False, None)
+                    if sc_info:
+                        candidates.append(("soundcloud", sc_info))
             except Exception as e:
                 logger.warning(f"[soundcloud] extract failed for '{query}': {str(e)[:160]}")
 
