@@ -11,7 +11,7 @@ import urllib.request
 from pathlib import Path
 from typing import Optional
 
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.responses import FileResponse, StreamingResponse
 from ytmusicapi import YTMusic
 import yt_dlp
@@ -21,7 +21,7 @@ logger = logging.getLogger("MusicServer")
 
 CACHE_DIR = Path(os.environ.get("MUSIC_CACHE_DIR", "/tmp/music_cache"))
 CACHE_DIR.mkdir(parents=True, exist_ok=True)
-MAX_CACHE_FILES = int(os.environ.get("MAX_CACHE_FILES", "8"))
+MAX_CACHE_FILES = int(os.environ.get("MAX_CACHE_FILES", "16"))
 MP3_BITRATE = os.environ.get("MP3_BITRATE", "96k")
 COOKIES_FILE = os.environ.get("YTDLP_COOKIES", "")
 FALLBACK_MUSIC_SERVER = os.environ.get(
@@ -47,8 +47,11 @@ def _get_cookies_path() -> Optional[str]:
 
 
 def _cleanup_cache() -> None:
-    """Keep cache directory bounded by removing oldest MP3 files."""
-    files = sorted(CACHE_DIR.glob("*.mp3"), key=lambda p: p.stat().st_mtime)
+    """Keep cache directory bounded by removing oldest inactive MP3 files."""
+    files = sorted(
+        (p for p in CACHE_DIR.glob("*.mp3") if p.name not in DOWNLOAD_TASKS),
+        key=lambda p: p.stat().st_mtime,
+    )
     while len(files) > MAX_CACHE_FILES:
         oldest = files.pop(0)
         try:
@@ -171,17 +174,42 @@ async def _terminate_proc(proc: Optional[asyncio.subprocess.Process]) -> None:
             pass
 
 
-def _download_direct_mp3_sync(stream_url: str, headers: dict, part_path: Path, timeout: int = 15) -> int:
-    req = urllib.request.Request(stream_url, headers=headers)
+def _download_direct_mp3_sync(stream_url: str, headers: dict, part_path: Path, timeout: int = 20) -> int:
     total = 0
-    with urllib.request.urlopen(req, timeout=timeout) as resp, open(part_path, "wb") as f:
-        while True:
-            chunk = resp.read(32768)
-            if not chunk:
-                break
-            f.write(chunk)
-            f.flush()
-            total += len(chunk)
+    for attempt in range(3):
+        req_headers = dict(headers)
+        mode = "wb"
+        if total > 0:
+            req_headers["Range"] = f"bytes={total}-"
+            mode = "ab"
+        req = urllib.request.Request(stream_url, headers=req_headers)
+        try:
+            with urllib.request.urlopen(req, timeout=timeout) as resp, open(part_path, mode) as f:
+                if total > 0 and resp.status != 206:
+                    # Server ignored Range; restart cleanly from 0
+                    f.close()
+                    total = 0
+                    with open(part_path, "wb") as f_reset:
+                        while True:
+                            chunk = resp.read(32768)
+                            if not chunk:
+                                break
+                            f_reset.write(chunk)
+                            f_reset.flush()
+                            total += len(chunk)
+                    return total
+                while True:
+                    chunk = resp.read(32768)
+                    if not chunk:
+                        break
+                    f.write(chunk)
+                    f.flush()
+                    total += len(chunk)
+            return total
+        except Exception as e:
+            if attempt == 2 or total == 0:
+                raise
+            logger.warning(f"Direct MP3 download interrupted at {total} bytes (attempt {attempt + 1}/3): {e}")
     return total
 
 
@@ -210,7 +238,12 @@ def _fetch_kho2_meta(song: str, artist: str = "") -> Optional[dict]:
 async def _ffmpeg_stream_to_part(stream_url: str, headers: dict, part_path: Path) -> int:
     ff_cmd = ["ffmpeg", "-loglevel", "error"]
     if stream_url.startswith("http"):
-        ff_cmd += ["-reconnect", "1", "-reconnect_streamed", "1", "-reconnect_delay_max", "3"]
+        ff_cmd += [
+            "-reconnect", "1",
+            "-reconnect_streamed", "1",
+            "-reconnect_delay_max", "5",
+            "-rw_timeout", "15000000",
+        ]
     if headers:
         hdr_str = "".join(f"{k}: {v}\r\n" for k, v in headers.items())
         ff_cmd += ["-headers", hdr_str]
@@ -393,10 +426,12 @@ def _ensure_download_task(filename: str, target_mp3: Path, query: str) -> Option
     return task
 
 
-async def _tail_mp3_stream(filename: str, target_mp3: Path, task: Optional[asyncio.Task]):
+async def _tail_mp3_stream(
+    filename: str, target_mp3: Path, task: Optional[asyncio.Task], start_offset: int = 0
+):
     """Tail .part (and final .mp3) as bytes arrive so ESP32-S3 starts playing ASAP."""
     part_path = CACHE_DIR / f"{filename}.part"
-    offset = 0
+    offset = max(0, start_offset)
     while True:
         src = target_mp3 if target_mp3.exists() else (part_path if part_path.exists() else None)
         if src is not None:
@@ -510,7 +545,11 @@ async def stream_pcm(
 
 
 @app.get("/audio/{filename}")
-async def get_audio(filename: str, q: str = Query("", description="Optional fallback query")):
+async def get_audio(
+    filename: str,
+    request: Request,
+    q: str = Query("", description="Optional fallback query"),
+):
     if not re.fullmatch(r"[A-Za-z0-9_-]+\.mp3", filename):
         raise HTTPException(status_code=400, detail="Invalid filename")
     path = CACHE_DIR / filename
@@ -518,9 +557,22 @@ async def get_audio(filename: str, q: str = Query("", description="Optional fall
         os.utime(path, None)
         return FileResponse(path, media_type="audio/mpeg")
 
+    start_offset = 0
+    range_header = request.headers.get("range", "")
+    m = re.match(r"bytes=(\d+)-", range_header.strip())
+    if m:
+        start_offset = int(m.group(1))
+
     query = q or PENDING_QUERIES.get(filename, "")
     task = _ensure_download_task(filename, path, query)
+    headers = {"Accept-Ranges": "bytes"}
+    status_code = 200
+    if start_offset > 0:
+        status_code = 206
+        headers["Content-Range"] = f"bytes {start_offset}-/*"
     return StreamingResponse(
-        _tail_mp3_stream(filename, path, task),
+        _tail_mp3_stream(filename, path, task, start_offset=start_offset),
+        status_code=status_code,
+        headers=headers,
         media_type="audio/mpeg",
     )
