@@ -1,9 +1,12 @@
 import os
 import re
 import sys
+import json
+import uuid
 import shutil
 import asyncio
 import logging
+import urllib.parse
 import urllib.request
 from pathlib import Path
 from typing import Optional
@@ -21,11 +24,16 @@ CACHE_DIR.mkdir(parents=True, exist_ok=True)
 MAX_CACHE_FILES = int(os.environ.get("MAX_CACHE_FILES", "8"))
 MP3_BITRATE = os.environ.get("MP3_BITRATE", "96k")
 COOKIES_FILE = os.environ.get("YTDLP_COOKIES", "")
+FALLBACK_MUSIC_SERVER = os.environ.get(
+    "FALLBACK_MUSIC_SERVER", "https://xiaozhi-music-server-y4qs.onrender.com"
+).rstrip("/")
 
 app = FastAPI(title="Xiaozhi Music Server")
 ytmusic = YTMusic()
 # Map audio filename -> original search query for seamless SoundCloud fallback
 PENDING_QUERIES: dict[str, str] = {}
+PENDING_SONG_ARTIST: dict[str, tuple[str, str]] = {}
+PENDING_FALLBACK_URLS: dict[str, str] = {}
 DOWNLOAD_TASKS: dict[str, asyncio.Task] = {}
 
 
@@ -163,10 +171,10 @@ async def _terminate_proc(proc: Optional[asyncio.subprocess.Process]) -> None:
             pass
 
 
-def _download_direct_mp3_sync(stream_url: str, headers: dict, part_path: Path) -> int:
+def _download_direct_mp3_sync(stream_url: str, headers: dict, part_path: Path, timeout: int = 15) -> int:
     req = urllib.request.Request(stream_url, headers=headers)
     total = 0
-    with urllib.request.urlopen(req, timeout=15) as resp, open(part_path, "wb") as f:
+    with urllib.request.urlopen(req, timeout=timeout) as resp, open(part_path, "wb") as f:
         while True:
             chunk = resp.read(32768)
             if not chunk:
@@ -175,6 +183,28 @@ def _download_direct_mp3_sync(stream_url: str, headers: dict, part_path: Path) -
             f.flush()
             total += len(chunk)
     return total
+
+
+def _fetch_kho2_meta(song: str, artist: str = "") -> Optional[dict]:
+    """Query fallback Kho 2 server (/stream_pcm) and normalize audio_url to an absolute URL."""
+    if not FALLBACK_MUSIC_SERVER:
+        return None
+    params = {"song": song}
+    if artist:
+        params["artist"] = artist
+    url = f"{FALLBACK_MUSIC_SERVER}/stream_pcm?{urllib.parse.urlencode(params)}"
+    req = urllib.request.Request(url, headers={"User-Agent": "XiaozhiMusicMerger/1.0"})
+    with urllib.request.urlopen(req, timeout=25) as resp:
+        if resp.status != 200:
+            return None
+        data = json.loads(resp.read().decode("utf-8"))
+    audio_url = data.get("audio_url") or ""
+    if not audio_url:
+        return None
+    if not audio_url.startswith("http"):
+        audio_url = f"{FALLBACK_MUSIC_SERVER}{audio_url if audio_url.startswith('/') else '/' + audio_url}"
+    data["audio_url"] = audio_url
+    return data
 
 
 async def _ffmpeg_stream_to_part(stream_url: str, headers: dict, part_path: Path) -> int:
@@ -288,6 +318,26 @@ async def _download_to_part(filename: str, target_mp3: Path, query: str) -> None
             except Exception as e:
                 logger.warning(f"[ytmusic-cookies-fallback] extract failed for {filename}: {str(e)[:160]}")
 
+        direct_k2_url = PENDING_FALLBACK_URLS.get(filename)
+        if direct_k2_url:
+            try:
+                part_path.unlink(missing_ok=True)
+                total = await asyncio.to_thread(
+                    _download_direct_mp3_sync,
+                    direct_k2_url,
+                    {"User-Agent": "XiaozhiMusicMerger/1.0"},
+                    part_path,
+                    30,
+                )
+                if total > 4096 and part_path.exists():
+                    os.replace(part_path, target_mp3)
+                    _cleanup_cache()
+                    logger.info(f"[kho2-direct] cached {filename} ({total} bytes)")
+                    return
+            except Exception as e:
+                logger.warning(f"[kho2-direct] failed for {filename}: {e}")
+                part_path.unlink(missing_ok=True)
+
         for label, info in candidates:
             try:
                 part_path.unlink(missing_ok=True)
@@ -304,6 +354,31 @@ async def _download_to_part(filename: str, target_mp3: Path, query: str) -> None
             except Exception as e:
                 logger.warning(f"[{label}] stream failed for {filename}: {e}")
                 part_path.unlink(missing_ok=True)
+
+        if FALLBACK_MUSIC_SERVER and not direct_k2_url:
+            song_k2, artist_k2 = PENDING_SONG_ARTIST.get(
+                filename, (query.split("|")[-1] if query else filename.removesuffix(".mp3"), "")
+            )
+            if song_k2:
+                try:
+                    k2_meta = await asyncio.to_thread(_fetch_kho2_meta, song_k2, artist_k2)
+                    if k2_meta and k2_meta.get("audio_url"):
+                        part_path.unlink(missing_ok=True)
+                        total = await asyncio.to_thread(
+                            _download_direct_mp3_sync,
+                            k2_meta["audio_url"],
+                            {"User-Agent": "XiaozhiMusicMerger/1.0"},
+                            part_path,
+                            30,
+                        )
+                        if total > 4096 and part_path.exists():
+                            os.replace(part_path, target_mp3)
+                            _cleanup_cache()
+                            logger.info(f"[kho2-fallback] cached {filename} ({total} bytes)")
+                            return
+                except Exception as e:
+                    logger.warning(f"[kho2-fallback] failed for {filename}: {e}")
+                    part_path.unlink(missing_ok=True)
     finally:
         DOWNLOAD_TASKS.pop(filename, None)
 
@@ -359,8 +434,9 @@ def health():
     cached = len(list(CACHE_DIR.glob("*.mp3")))
     return {
         "status": "ok",
-        "service": "Xiaozhi Music Server (YouTube Music -> MP3)",
+        "service": "Xiaozhi Music Server (YouTube Music + SoundCloud + Kho 2 -> MP3)",
         "cached_tracks": cached,
+        "fallback_server": FALLBACK_MUSIC_SERVER,
     }
 
 
@@ -376,8 +452,11 @@ async def stream_pcm(
         filename = f"{meta['video_id']}.mp3"
         # Save song-only fallback separated by '|' if artist was provided
         PENDING_QUERIES[filename] = f"{song}|{query}" if artist else query
+        PENDING_SONG_ARTIST[filename] = (song, artist)
         if len(PENDING_QUERIES) > 100:
             PENDING_QUERIES.pop(next(iter(PENDING_QUERIES)))
+        if len(PENDING_SONG_ARTIST) > 100:
+            PENDING_SONG_ARTIST.pop(next(iter(PENDING_SONG_ARTIST)))
         _ensure_download_task(filename, CACHE_DIR / filename, PENDING_QUERIES[filename])
         return {
             "title": meta["title"],
@@ -393,6 +472,7 @@ async def stream_pcm(
         if sc_meta:
             filename = sc_meta["filename"]
             PENDING_QUERIES[filename] = query
+            PENDING_SONG_ARTIST[filename] = (song, artist)
             _ensure_download_task(filename, CACHE_DIR / filename, PENDING_QUERIES[filename])
             return {
                 "title": sc_meta["title"],
@@ -405,7 +485,28 @@ async def stream_pcm(
     except Exception as e:
         logger.error(f"SoundCloud search failed for '{query}': {e}")
 
-    raise HTTPException(status_code=404, detail="Song not found on YouTube Music or SoundCloud")
+    if FALLBACK_MUSIC_SERVER:
+        try:
+            k2_meta = await asyncio.to_thread(_fetch_kho2_meta, song, artist)
+            if k2_meta and k2_meta.get("audio_url"):
+                filename = f"k2_{uuid.uuid4().hex[:12]}.mp3"
+                PENDING_FALLBACK_URLS[filename] = k2_meta["audio_url"]
+                PENDING_SONG_ARTIST[filename] = (song, artist)
+                if len(PENDING_FALLBACK_URLS) > 100:
+                    PENDING_FALLBACK_URLS.pop(next(iter(PENDING_FALLBACK_URLS)))
+                _ensure_download_task(filename, CACHE_DIR / filename, query)
+                return {
+                    "title": k2_meta.get("title") or song,
+                    "artist": k2_meta.get("artist") or artist,
+                    "duration": k2_meta.get("duration") or 0,
+                    "audio_url": f"/audio/{filename}",
+                    "lyric_url": k2_meta.get("lyric_url") or "",
+                    "source": "kho2",
+                }
+        except Exception as e:
+            logger.error(f"Kho 2 fallback failed for '{query}': {e}")
+
+    raise HTTPException(status_code=404, detail="Song not found on Kho 1 (YouTube Music / SoundCloud) or Kho 2")
 
 
 @app.get("/audio/{filename}")
