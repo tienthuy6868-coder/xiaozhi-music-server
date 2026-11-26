@@ -219,19 +219,24 @@ async def _ffmpeg_stream_to_part(stream_url: str, headers: dict, part_path: Path
         raise
 
 
-def _search_soundcloud_url(query: str, max_duration: int = 600) -> Optional[str]:
-    """Fast flat SoundCloud search (1 request) picking a normal-length song (60s..600s)."""
+def _search_soundcloud_urls(query: str, max_duration: int = 600) -> list[str]:
+    """Fast flat SoundCloud search returning ordered candidate URLs (60s..600s first)."""
     ydl_opts = {"quiet": True, "no_warnings": True, "extract_flat": True, "socket_timeout": 5}
     with yt_dlp.YoutubeDL(ydl_opts) as ydl:
         info = ydl.extract_info(f"scsearch5:{query}", download=False)
         entries = [e for e in (info.get("entries") or []) if e]
         if not entries:
-            return None
+            return []
         preferred = [e for e in entries if 60 <= (e.get("duration") or 0) <= max_duration]
-        if not preferred:
-            preferred = [e for e in entries if (e.get("duration") or 0) <= max_duration]
-        chosen = preferred[0] if preferred else entries[0]
-        return chosen.get("url") or chosen.get("webpage_url")
+        short = [e for e in entries if (e.get("duration") or 0) < 60]
+        long = [e for e in entries if (e.get("duration") or 0) > max_duration]
+        ordered = preferred + short + long
+        urls: list[str] = []
+        for e in ordered:
+            u = e.get("url") or e.get("webpage_url")
+            if u and u not in urls:
+                urls.append(u)
+        return urls
 
 
 async def _download_to_part(filename: str, target_mp3: Path, query: str) -> None:
@@ -252,13 +257,17 @@ async def _download_to_part(filename: str, target_mp3: Path, query: str) -> None
 
         if query:
             try:
-                sc_url = await asyncio.to_thread(_search_soundcloud_url, query, 600)
-                if sc_url:
-                    sc_info = await asyncio.to_thread(_extract_stream_url, sc_url, False, None)
-                    if sc_info:
-                        candidates.append(("soundcloud", sc_info))
+                sc_urls = await asyncio.to_thread(_search_soundcloud_urls, query, 600)
+                for sc_url in sc_urls:
+                    try:
+                        sc_info = await asyncio.to_thread(_extract_stream_url, sc_url, False, None)
+                        if sc_info:
+                            candidates.append(("soundcloud", sc_info))
+                            break
+                    except Exception as e:
+                        logger.warning(f"[soundcloud] skip candidate {sc_url}: {str(e)[:140]}")
             except Exception as e:
-                logger.warning(f"[soundcloud] extract failed for '{query}': {str(e)[:160]}")
+                logger.warning(f"[soundcloud] search failed for '{query}': {str(e)[:160]}")
 
         for label, info in candidates:
             try:
