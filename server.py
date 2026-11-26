@@ -256,18 +256,37 @@ async def _download_to_part(filename: str, target_mp3: Path, query: str) -> None
                 logger.warning(f"[ytmusic-cookies] extract failed for {filename}: {str(e)[:160]}")
 
         if query:
+            if "|" in query:
+                song_only, full_q = query.split("|", 1)
+                queries_to_try = [full_q, song_only]
+            else:
+                queries_to_try = [query]
+            for q_try in queries_to_try:
+                try:
+                    sc_urls = await asyncio.to_thread(_search_soundcloud_urls, q_try, 600)
+                    for sc_url in sc_urls:
+                        try:
+                            sc_info = await asyncio.to_thread(_extract_stream_url, sc_url, False, None)
+                            if sc_info:
+                                candidates.append(("soundcloud", sc_info))
+                                break
+                        except Exception as e:
+                            logger.warning(f"[soundcloud] skip candidate {sc_url}: {str(e)[:140]}")
+                    if candidates:
+                        break
+                except Exception as e:
+                    logger.warning(f"[soundcloud] search failed for '{q_try}': {str(e)[:160]}")
+
+        # If SoundCloud failed/DRM and we haven't tried YouTube yet, fall back to YouTube Music with cookies
+        if not candidates and not filename.startswith("sc_"):
+            video_id = filename[:-4]
+            yt_url = f"https://music.youtube.com/watch?v={video_id}"
             try:
-                sc_urls = await asyncio.to_thread(_search_soundcloud_urls, query, 600)
-                for sc_url in sc_urls:
-                    try:
-                        sc_info = await asyncio.to_thread(_extract_stream_url, sc_url, False, None)
-                        if sc_info:
-                            candidates.append(("soundcloud", sc_info))
-                            break
-                    except Exception as e:
-                        logger.warning(f"[soundcloud] skip candidate {sc_url}: {str(e)[:140]}")
+                yt_info = await asyncio.to_thread(_extract_stream_url, yt_url, True, ["tv", "web"])
+                if yt_info:
+                    candidates.append(("ytmusic-cookies-fallback", yt_info))
             except Exception as e:
-                logger.warning(f"[soundcloud] search failed for '{query}': {str(e)[:160]}")
+                logger.warning(f"[ytmusic-cookies-fallback] extract failed for {filename}: {str(e)[:160]}")
 
         for label, info in candidates:
             try:
@@ -355,10 +374,11 @@ async def stream_pcm(
     meta = await asyncio.to_thread(_search_ytmusic, song, artist)
     if meta and meta.get("video_id"):
         filename = f"{meta['video_id']}.mp3"
-        PENDING_QUERIES[filename] = query
+        # Save song-only fallback separated by '|' if artist was provided
+        PENDING_QUERIES[filename] = f"{song}|{query}" if artist else query
         if len(PENDING_QUERIES) > 100:
             PENDING_QUERIES.pop(next(iter(PENDING_QUERIES)))
-        _ensure_download_task(filename, CACHE_DIR / filename, query)
+        _ensure_download_task(filename, CACHE_DIR / filename, PENDING_QUERIES[filename])
         return {
             "title": meta["title"],
             "artist": meta["artist"],
@@ -373,7 +393,7 @@ async def stream_pcm(
         if sc_meta:
             filename = sc_meta["filename"]
             PENDING_QUERIES[filename] = query
-            _ensure_download_task(filename, CACHE_DIR / filename, query)
+            _ensure_download_task(filename, CACHE_DIR / filename, PENDING_QUERIES[filename])
             return {
                 "title": sc_meta["title"],
                 "artist": sc_meta["artist"],
