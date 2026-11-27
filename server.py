@@ -21,7 +21,7 @@ logger = logging.getLogger("MusicServer")
 
 CACHE_DIR = Path(os.environ.get("MUSIC_CACHE_DIR", "/tmp/music_cache"))
 CACHE_DIR.mkdir(parents=True, exist_ok=True)
-MAX_CACHE_FILES = int(os.environ.get("MAX_CACHE_FILES", "16"))
+MAX_CACHE_FILES = int(os.environ.get("MAX_CACHE_FILES", "120"))
 MP3_BITRATE = os.environ.get("MP3_BITRATE", "96k")
 COOKIES_FILE = os.environ.get("YTDLP_COOKIES", "")
 FALLBACK_MUSIC_SERVER = os.environ.get(
